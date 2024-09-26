@@ -55,6 +55,9 @@
 
 #define I2S_SP_INSTANCE                 0x01
 #define I2S_BT_INSTANCE                 0x02
+#define I2S_MICSP_INSTANCE		0x03
+#define CAP_CHANNEL0			0x00
+#define CAP_CHANNEL1			0x01
 
 #define ACP_TILE_ON_MASK                0x03
 #define ACP_TILE_OFF_MASK               0x02
@@ -72,16 +75,20 @@
 #define ACP_TO_I2S_DMA_CH_NUM 13
 
 /* Capture DMA channels */
-#define ACP_TO_SYSRAM_CH_NUM 14
-#define I2S_TO_ACP_DMA_CH_NUM 15
+#define I2S_TO_ACP_DMA_CH_NUM 14
+#define ACP_TO_SYSRAM_CH_NUM 15
 
 /* Playback DMA Channels for I2S BT instance */
 #define SYSRAM_TO_ACP_BT_INSTANCE_CH_NUM  8
 #define ACP_TO_I2S_DMA_BT_INSTANCE_CH_NUM 9
 
 /* Capture DMA Channels for I2S BT Instance */
-#define ACP_TO_SYSRAM_BT_INSTANCE_CH_NUM 10
-#define I2S_TO_ACP_DMA_BT_INSTANCE_CH_NUM 11
+#define I2S_TO_ACP_DMA_BT_INSTANCE_CH_NUM 10
+#define ACP_TO_SYSRAM_BT_INSTANCE_CH_NUM 11
+
+/* Playback DMA channels for I2S MICSP instance */
+#define SYSRAM_TO_ACP_MICSP_INSTANCE_CH_NUM  4
+#define ACP_TO_I2S_DMA_MICSP_INSTANCE_CH_NUM 5
 
 #define NUM_DSCRS_PER_CHANNEL 2
 
@@ -106,8 +113,15 @@
 #define CAPTURE_START_DMA_DESCR_CH11 14
 #define CAPTURE_END_DMA_DESCR_CH11 15
 
+/* I2S MICSP Instance DMA Descriptors */
+#define PLAYBACK_START_DMA_DESCR_CH4 0
+#define PLAYBACK_END_DMA_DESCR_CH4 1
+#define PLAYBACK_START_DMA_DESCR_CH5 2
+#define PLAYBACK_END_DMA_DESCR_CH5 3
+
 #define mmACP_I2S_16BIT_RESOLUTION_EN       0x5209
 #define ACP_I2S_MIC_16BIT_RESOLUTION_EN 0x01
+#define ACP_I2S_MICSP_16BIT_RESOLUTION_EN 0x01
 #define ACP_I2S_SP_16BIT_RESOLUTION_EN	0x02
 #define ACP_I2S_BT_16BIT_RESOLUTION_EN	0x04
 #define ACP_BT_UART_PAD_SELECT_MASK	0x1
@@ -121,10 +135,11 @@ enum acp_dma_priority_level {
 };
 
 struct audio_substream_data {
-	struct page *pg;
+	dma_addr_t dma_addr;
 	unsigned int order;
 	u16 num_of_pages;
 	u16 i2s_instance;
+	u16 capture_channel;
 	u16 direction;
 	u16 ch1;
 	u16 ch2;
@@ -135,6 +150,7 @@ struct audio_substream_data {
 	u32 sram_bank;
 	u32 byte_cnt_high_reg_offset;
 	u32 byte_cnt_low_reg_offset;
+	u32 dma_curr_dscr;
 	uint64_t size;
 	u64 bytescount;
 	void __iomem *acp_mmio;
@@ -145,8 +161,10 @@ struct audio_drv_data {
 	struct snd_pcm_substream *capture_i2ssp_stream;
 	struct snd_pcm_substream *play_i2sbt_stream;
 	struct snd_pcm_substream *capture_i2sbt_stream;
+	struct snd_pcm_substream *play_i2s_micsp_stream;
 	void __iomem *acp_mmio;
 	u32 asic_type;
+	snd_pcm_sframes_t delay;
 };
 
 /*
@@ -154,7 +172,9 @@ struct audio_drv_data {
  * and dma driver
  */
 struct acp_platform_info {
-	u16 i2s_instance;
+	u16 play_i2s_instance;
+	u16 cap_i2s_instance;
+	u16 capture_channel;
 };
 
 union acp_dma_count {
@@ -197,5 +217,7 @@ typedef struct acp_dma_dscr_transfer {
 	/* Reserved for future use */
 	u32 reserved;
 } acp_dma_dscr_transfer_t;
+
+extern bool acp_bt_uart_enable;
 
 #endif /*__ACP_HW_H */

@@ -39,9 +39,9 @@ SYSCALL_DEFINE0(getpagesize)
 	return PAGE_SIZE; /* Possibly older binaries want 8192 on sun4's? */
 }
 
-unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags)
+unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags, vm_flags_t vm_flags)
 {
-	struct vm_unmapped_area_info info;
+	struct vm_unmapped_area_info info = {};
 
 	if (flags & MAP_FIXED) {
 		/* We do not accept a shared mapping if it would violate
@@ -59,7 +59,6 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
 	if (!addr)
 		addr = TASK_UNMAPPED_BASE;
 
-	info.flags = 0;
 	info.length = len;
 	info.low_limit = addr;
 	info.high_limit = TASK_SIZE;
@@ -151,7 +150,7 @@ sparc_breakpoint (struct pt_regs *regs)
 #ifdef DEBUG_SPARC_BREAKPOINT
         printk ("TRAP: Entering kernel PC=%x, nPC=%x\n", regs->pc, regs->npc);
 #endif
-	force_sig_fault(SIGTRAP, TRAP_BRKPT, (void __user *)regs->pc, 0, current);
+	force_sig_fault(SIGTRAP, TRAP_BRKPT, (void __user *)regs->pc);
 
 #ifdef DEBUG_SPARC_BREAKPOINT
 	printk ("TRAP: Returning to space: PC=%x nPC=%x\n", regs->pc, regs->npc);
@@ -197,23 +196,27 @@ SYSCALL_DEFINE5(rt_sigaction, int, sig,
 
 SYSCALL_DEFINE2(getdomainname, char __user *, name, int, len)
 {
- 	int nlen, err;
- 	
+	int nlen, err;
+	char tmp[__NEW_UTS_LEN + 1];
+
 	if (len < 0)
 		return -EINVAL;
 
- 	down_read(&uts_sem);
- 	
+	down_read(&uts_sem);
+
 	nlen = strlen(utsname()->domainname) + 1;
 	err = -EINVAL;
 	if (nlen > len)
-		goto out;
+		goto out_unlock;
+	memcpy(tmp, utsname()->domainname, nlen);
 
-	err = -EFAULT;
-	if (!copy_to_user(name, utsname()->domainname, nlen))
-		err = 0;
+	up_read(&uts_sem);
 
-out:
+	if (copy_to_user(name, tmp, nlen))
+		return -EFAULT;
+	return 0;
+
+out_unlock:
 	up_read(&uts_sem);
 	return err;
 }

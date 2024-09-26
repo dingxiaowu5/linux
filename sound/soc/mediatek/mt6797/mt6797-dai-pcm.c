@@ -183,6 +183,8 @@ static int mtk_dai_pcm_hw_params(struct snd_pcm_substream *substream,
 				 struct snd_soc_dai *dai)
 {
 	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
+	struct snd_soc_dapm_widget *p = snd_soc_dai_get_widget_playback(dai);
+	struct snd_soc_dapm_widget *c = snd_soc_dai_get_widget_capture(dai);
 	unsigned int rate = params_rate(params);
 	unsigned int rate_reg = mt6797_rate_transform(afe->dev, rate, dai->id);
 	unsigned int pcm_con = 0;
@@ -193,10 +195,10 @@ static int mtk_dai_pcm_hw_params(struct snd_pcm_substream *substream,
 		substream->stream,
 		rate,
 		rate_reg,
-		dai->playback_widget->active,
-		dai->capture_widget->active);
+		p->active,
+		c->active);
 
-	if (dai->playback_widget->active || dai->capture_widget->active)
+	if (p->active || c->active)
 		return 0;
 
 	switch (dai->id) {
@@ -270,8 +272,8 @@ static struct snd_soc_dai_driver mtk_dai_pcm_driver[] = {
 			.formats = MTK_PCM_FORMATS,
 		},
 		.ops = &mtk_dai_pcm_ops,
-		.symmetric_rates = 1,
-		.symmetric_samplebits = 1,
+		.symmetric_rate = 1,
+		.symmetric_sample_bits = 1,
 	},
 	{
 		.name = "PCM 2",
@@ -291,22 +293,27 @@ static struct snd_soc_dai_driver mtk_dai_pcm_driver[] = {
 			.formats = MTK_PCM_FORMATS,
 		},
 		.ops = &mtk_dai_pcm_ops,
-		.symmetric_rates = 1,
-		.symmetric_samplebits = 1,
+		.symmetric_rate = 1,
+		.symmetric_sample_bits = 1,
 	},
 };
 
 int mt6797_dai_pcm_register(struct mtk_base_afe *afe)
 {
-	int id = MT6797_DAI_PCM_1;
+	struct mtk_base_afe_dai *dai;
 
-	afe->sub_dais[id].dai_drivers = mtk_dai_pcm_driver;
-	afe->sub_dais[id].num_dai_drivers = ARRAY_SIZE(mtk_dai_pcm_driver);
+	dai = devm_kzalloc(afe->dev, sizeof(*dai), GFP_KERNEL);
+	if (!dai)
+		return -ENOMEM;
 
-	afe->sub_dais[id].dapm_widgets = mtk_dai_pcm_widgets;
-	afe->sub_dais[id].num_dapm_widgets = ARRAY_SIZE(mtk_dai_pcm_widgets);
-	afe->sub_dais[id].dapm_routes = mtk_dai_pcm_routes;
-	afe->sub_dais[id].num_dapm_routes = ARRAY_SIZE(mtk_dai_pcm_routes);
+	list_add(&dai->list, &afe->sub_dais);
 
+	dai->dai_drivers = mtk_dai_pcm_driver;
+	dai->num_dai_drivers = ARRAY_SIZE(mtk_dai_pcm_driver);
+
+	dai->dapm_widgets = mtk_dai_pcm_widgets;
+	dai->num_dapm_widgets = ARRAY_SIZE(mtk_dai_pcm_widgets);
+	dai->dapm_routes = mtk_dai_pcm_routes;
+	dai->num_dapm_routes = ARRAY_SIZE(mtk_dai_pcm_routes);
 	return 0;
 }

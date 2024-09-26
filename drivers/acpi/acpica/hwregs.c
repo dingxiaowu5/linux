@@ -446,7 +446,7 @@ struct acpi_bit_register_info *acpi_hw_get_bit_register_info(u32 register_id)
  * RETURN:      Status
  *
  * DESCRIPTION: Write the PM1 A/B control registers. These registers are
- *              different than than the PM1 A/B status and enable registers
+ *              different than the PM1 A/B status and enable registers
  *              in that different values can be written to the A/B registers.
  *              Most notably, the SLP_TYP bits can be different, as per the
  *              values returned from the _Sx predefined methods.
@@ -528,13 +528,18 @@ acpi_status acpi_hw_register_read(u32 register_id, u32 *return_value)
 
 		status =
 		    acpi_hw_read(&value64, &acpi_gbl_FADT.xpm2_control_block);
-		value = (u32)value64;
+		if (ACPI_SUCCESS(status)) {
+			value = (u32)value64;
+		}
 		break;
 
 	case ACPI_REGISTER_PM_TIMER:	/* 32-bit access */
 
 		status = acpi_hw_read(&value64, &acpi_gbl_FADT.xpm_timer_block);
-		value = (u32)value64;
+		if (ACPI_SUCCESS(status)) {
+			value = (u32)value64;
+		}
+
 		break;
 
 	case ACPI_REGISTER_SMI_COMMAND_BLOCK:	/* 8-bit access */

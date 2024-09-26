@@ -66,7 +66,6 @@
 #define HHI_USB_CLK_CNTL		0x220 /* 0x88 offset in data sheet */
 #define HHI_32K_CLK_CNTL		0x224 /* 0x89 offset in data sheet */
 #define HHI_GEN_CLK_CNTL		0x228 /* 0x8a offset in data sheet */
-#define HHI_GEN_CLK_CNTL		0x228 /* 0x8a offset in data sheet */
 
 #define HHI_PCM_CLK_CNTL		0x258 /* 0x96 offset in data sheet */
 #define HHI_NAND_CLK_CNTL		0x25C /* 0x97 offset in data sheet */
@@ -112,56 +111,5 @@
 #define HHI_VID_LOCK_CLK_CNTL		0x3C8 /* 0xf2 offset in data sheet */
 #define HHI_BT656_CLK_CNTL		0x3D4 /* 0xf5 offset in data sheet */
 #define HHI_SAR_CLK_CNTL		0x3D8 /* 0xf6 offset in data sheet */
-
-/*
- * CLKID index values
- *
- * These indices are entirely contrived and do not map onto the hardware.
- * It has now been decided to expose everything by default in the DT header:
- * include/dt-bindings/clock/gxbb-clkc.h. Only the clocks ids we don't want
- * to expose, such as the internal muxes and dividers of composite clocks,
- * will remain defined here.
- */
-/* ID 1 is unused (it was used by the non-existing CLKID_CPUCLK before) */
-#define CLKID_MPEG_SEL		  10
-#define CLKID_MPEG_DIV		  11
-#define CLKID_SAR_ADC_DIV	  99
-#define CLKID_MALI_0_DIV	  101
-#define CLKID_MALI_1_DIV	  104
-#define CLKID_CTS_AMCLK_SEL	  108
-#define CLKID_CTS_AMCLK_DIV	  109
-#define CLKID_CTS_MCLK_I958_SEL	  111
-#define CLKID_CTS_MCLK_I958_DIV	  112
-#define CLKID_32K_CLK_SEL	  115
-#define CLKID_32K_CLK_DIV	  116
-#define CLKID_SD_EMMC_A_CLK0_SEL  117
-#define CLKID_SD_EMMC_A_CLK0_DIV  118
-#define CLKID_SD_EMMC_B_CLK0_SEL  120
-#define CLKID_SD_EMMC_B_CLK0_DIV  121
-#define CLKID_SD_EMMC_C_CLK0_SEL  123
-#define CLKID_SD_EMMC_C_CLK0_DIV  124
-#define CLKID_VPU_0_DIV		  127
-#define CLKID_VPU_1_DIV		  130
-#define CLKID_VAPB_0_DIV	  134
-#define CLKID_VAPB_1_DIV	  137
-#define CLKID_HDMI_PLL_PRE_MULT	  141
-#define CLKID_MPLL0_DIV		  142
-#define CLKID_MPLL1_DIV		  143
-#define CLKID_MPLL2_DIV		  144
-#define CLKID_MPLL_PREDIV	  145
-#define CLKID_FCLK_DIV2_DIV	  146
-#define CLKID_FCLK_DIV3_DIV	  147
-#define CLKID_FCLK_DIV4_DIV	  148
-#define CLKID_FCLK_DIV5_DIV	  149
-#define CLKID_FCLK_DIV7_DIV	  150
-#define CLKID_VDEC_1_SEL	  151
-#define CLKID_VDEC_1_DIV	  152
-#define CLKID_VDEC_HEVC_SEL	  154
-#define CLKID_VDEC_HEVC_DIV	  155
-
-#define NR_CLKS			  157
-
-/* include the CLKIDs that have been made part of the DT binding */
-#include <dt-bindings/clock/gxbb-clkc.h>
 
 #endif /* __GXBB_H */

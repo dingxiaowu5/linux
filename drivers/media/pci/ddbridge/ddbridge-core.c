@@ -1,23 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * ddbridge-core.c: Digital Devices bridge core functions
  *
  * Copyright (C) 2010-2017 Digital Devices GmbH
  *                         Marcus Metzler <mocm@metzlerbros.de>
  *                         Ralph Metzler <rjkm@metzlerbros.de>
- *
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 only, as published by the Free Software Foundation.
- *
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * To obtain the license, point your browser to
- * http://www.gnu.org/copyleft/gpl.html
  */
 
 #include <linux/module.h>
@@ -54,7 +41,7 @@
 #include "stv6111.h"
 #include "lnbh25.h"
 #include "cxd2099.h"
-#include "dvb_dummy_fe.h"
+#include "ddbridge-dummy-fe.h"
 
 /****************************************************************************/
 
@@ -1191,6 +1178,13 @@ static const struct lnbh25_config lnbh25_cfg = {
 	.data2_config = LNBH25_TEN
 };
 
+static int has_lnbh25(struct i2c_adapter *i2c, u8 adr)
+{
+	u8 val;
+
+	return i2c_read_reg(i2c, adr, 0, &val) ? 0 : 1;
+}
+
 static int demod_attach_stv0910(struct ddb_input *input, int type, int tsfast)
 {
 	struct i2c_adapter *i2c = &input->port->i2c->adap;
@@ -1224,14 +1218,15 @@ static int demod_attach_stv0910(struct ddb_input *input, int type, int tsfast)
 	/* attach lnbh25 - leftshift by one as the lnbh25 driver expects 8bit
 	 * i2c addresses
 	 */
-	lnbcfg.i2c_address = (((input->nr & 1) ? 0x0d : 0x0c) << 1);
-	if (!dvb_attach(lnbh25_attach, dvb->fe, &lnbcfg, i2c)) {
+	if (has_lnbh25(i2c, 0x0d))
+		lnbcfg.i2c_address = (((input->nr & 1) ? 0x0d : 0x0c) << 1);
+	else
 		lnbcfg.i2c_address = (((input->nr & 1) ? 0x09 : 0x08) << 1);
-		if (!dvb_attach(lnbh25_attach, dvb->fe, &lnbcfg, i2c)) {
-			dev_err(dev, "No LNBH25 found!\n");
-			dvb_frontend_detach(dvb->fe);
-			return -ENODEV;
-		}
+
+	if (!dvb_attach(lnbh25_attach, dvb->fe, &lnbcfg, i2c)) {
+		dev_err(dev, "No LNBH25 found!\n");
+		dvb_frontend_detach(dvb->fe);
+		return -ENODEV;
 	}
 
 	return 0;
@@ -1261,7 +1256,7 @@ static int demod_attach_dummy(struct ddb_input *input)
 	struct ddb_dvb *dvb = &input->port->dvb[input->nr & 1];
 	struct device *dev = input->port->dev->dev;
 
-	dvb->fe = dvb_attach(dvb_dummy_fe_qam_attach);
+	dvb->fe = dvb_attach(ddbridge_dummy_fe_qam_attach);
 	if (!dvb->fe) {
 		dev_err(dev, "QAM dummy attach failed!\n");
 		return -ENODEV;
@@ -1306,7 +1301,7 @@ static void dvb_input_detach(struct ddb_input *input)
 			dvb_unregister_frontend(dvb->fe2);
 		if (dvb->fe)
 			dvb_unregister_frontend(dvb->fe);
-		/* fallthrough */
+		fallthrough;
 	case 0x30:
 		dvb_module_release(dvb->i2c_client[0]);
 		dvb->i2c_client[0] = NULL;
@@ -1317,22 +1312,22 @@ static void dvb_input_detach(struct ddb_input *input)
 			dvb_frontend_detach(dvb->fe);
 		dvb->fe = NULL;
 		dvb->fe2 = NULL;
-		/* fallthrough */
+		fallthrough;
 	case 0x20:
 		dvb_net_release(&dvb->dvbnet);
-		/* fallthrough */
+		fallthrough;
 	case 0x12:
 		dvbdemux->dmx.remove_frontend(&dvbdemux->dmx,
 					      &dvb->hw_frontend);
 		dvbdemux->dmx.remove_frontend(&dvbdemux->dmx,
 					      &dvb->mem_frontend);
-		/* fallthrough */
+		fallthrough;
 	case 0x11:
 		dvb_dmxdev_release(&dvb->dmxdev);
-		/* fallthrough */
+		fallthrough;
 	case 0x10:
 		dvb_dmx_release(&dvb->demux);
-		/* fallthrough */
+		fallthrough;
 	case 0x01:
 		break;
 	}
@@ -1555,7 +1550,7 @@ static int dvb_input_attach(struct ddb_input *input)
 			osc24 = 0;
 		else
 			osc24 = 1;
-		/* fall-through */
+		fallthrough;
 	case DDB_TUNER_DVBCT2_SONY_P:
 	case DDB_TUNER_DVBC2T2_SONY_P:
 	case DDB_TUNER_ISDBT_SONY_P:
@@ -1571,7 +1566,7 @@ static int dvb_input_attach(struct ddb_input *input)
 		break;
 	case DDB_TUNER_DVBC2T2I_SONY:
 		osc24 = 1;
-		/* fall-through */
+		fallthrough;
 	case DDB_TUNER_DVBCT2_SONY:
 	case DDB_TUNER_DVBC2T2_SONY:
 	case DDB_TUNER_ISDBT_SONY:
@@ -1584,8 +1579,8 @@ static int dvb_input_attach(struct ddb_input *input)
 		if (demod_attach_dummy(input) < 0)
 			goto err_detach;
 		break;
-	case DDB_TUNER_MCI:
-		if (ddb_fe_attach_mci(input) < 0)
+	case DDB_TUNER_MCI_SX8:
+		if (ddb_fe_attach_mci(input, port->type) < 0)
 			goto err_detach;
 		break;
 	default:
@@ -1842,6 +1837,7 @@ static void ddb_port_probe(struct ddb_port *port)
 {
 	struct ddb *dev = port->dev;
 	u32 l = port->lnr;
+	struct ddb_link *link = &dev->link[l];
 	u8 id, type;
 
 	port->name = "NO MODULE";
@@ -1851,7 +1847,7 @@ static void ddb_port_probe(struct ddb_port *port)
 	/* Handle missing ports and ports without I2C */
 
 	if (dummy_tuner && !port->nr &&
-	    dev->link[0].ids.device == 0x0005) {
+	    link->ids.device == 0x0005) {
 		port->name = "DUMMY";
 		port->class = DDB_PORT_TUNER;
 		port->type = DDB_TUNER_DUMMY;
@@ -1865,14 +1861,14 @@ static void ddb_port_probe(struct ddb_port *port)
 		return;
 	}
 
-	if (port->nr == 1 && dev->link[l].info->type == DDB_OCTOPUS_CI &&
-	    dev->link[l].info->i2c_mask == 1) {
+	if (port->nr == 1 && link->info->type == DDB_OCTOPUS_CI &&
+	    link->info->i2c_mask == 1) {
 		port->name = "NO TAB";
 		port->class = DDB_PORT_NONE;
 		return;
 	}
 
-	if (dev->link[l].info->type == DDB_OCTOPUS_MAX) {
+	if (link->info->type == DDB_OCTOPUS_MAX) {
 		port->name = "DUAL DVB-S2 MAX";
 		port->type_name = "MXL5XX";
 		port->class = DDB_PORT_TUNER;
@@ -1883,17 +1879,17 @@ static void ddb_port_probe(struct ddb_port *port)
 		return;
 	}
 
-	if (dev->link[l].info->type == DDB_OCTOPUS_MCI) {
-		if (port->nr >= dev->link[l].info->mci)
+	if (link->info->type == DDB_OCTOPUS_MCI) {
+		if (port->nr >= link->info->mci_ports)
 			return;
 		port->name = "DUAL MCI";
 		port->type_name = "MCI";
 		port->class = DDB_PORT_TUNER;
-		port->type = DDB_TUNER_MCI;
+		port->type = DDB_TUNER_MCI + link->info->mci_type;
 		return;
 	}
 
-	if (port->nr > 1 && dev->link[l].info->type == DDB_OCTOPUS_CI) {
+	if (port->nr > 1 && link->info->type == DDB_OCTOPUS_CI) {
 		port->name = "CI internal";
 		port->type_name = "INTERNAL";
 		port->class = DDB_PORT_CI;
@@ -1978,7 +1974,7 @@ static void ddb_port_probe(struct ddb_port *port)
 		port->class = DDB_PORT_TUNER;
 		if (id == 0x51) {
 			if (port->nr == 0 &&
-			    dev->link[l].info->ts_quirks & TS_QUIRK_REVERSED)
+			    link->info->ts_quirks & TS_QUIRK_REVERSED)
 				port->type = DDB_TUNER_DVBS_STV0910_PR;
 			else
 				port->type = DDB_TUNER_DVBS_STV0910_P;
@@ -2031,7 +2027,7 @@ static int ddb_port_attach(struct ddb_port *port)
 		ret = ddb_ci_attach(port, ci_bitrate);
 		if (ret < 0)
 			break;
-		/* fall-through */
+		fallthrough;
 	case DDB_PORT_LOOP:
 		ret = dvb_register_device(port->dvb[0].adap,
 					  &port->dvb[0].dev,
@@ -2427,7 +2423,8 @@ void ddb_ports_init(struct ddb *dev)
 					ddb_input_init(port, 4 + i, 1, 4 + i);
 					ddb_output_init(port, i);
 					break;
-				} /* fallthrough */
+				}
+				fallthrough;
 			case DDB_OCTOPUS:
 				ddb_input_init(port, 2 * i, 0, 2 * i);
 				ddb_input_init(port, 2 * i + 1, 1, 2 * i + 1);
@@ -2719,9 +2716,9 @@ static const struct file_operations ddb_fops = {
 	.release        = ddb_release,
 };
 
-static char *ddb_devnode(struct device *device, umode_t *mode)
+static char *ddb_devnode(const struct device *device, umode_t *mode)
 {
-	struct ddb *dev = dev_get_drvdata(device);
+	const struct ddb *dev = dev_get_drvdata(device);
 
 	return kasprintf(GFP_KERNEL, "ddbridge/card%d", dev->nr);
 }
@@ -3120,7 +3117,6 @@ static struct device_attribute ddb_attrs_fanspeed[] = {
 
 static struct class ddb_class = {
 	.name		= "ddbridge",
-	.owner          = THIS_MODULE,
 	.devnode        = ddb_devnode,
 };
 
@@ -3412,7 +3408,7 @@ int ddb_exit_ddbridge(int stage, int error)
 	default:
 	case 2:
 		destroy_workqueue(ddb_wq);
-		/* fall-through */
+		fallthrough;
 	case 1:
 		ddb_class_destroy();
 		break;

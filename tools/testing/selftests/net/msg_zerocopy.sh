@@ -25,6 +25,8 @@ readonly path_sysctl_mem="net.core.optmem_max"
 if [[ "$#" -eq "0" ]]; then
 	$0 4 tcp -t 1
 	$0 6 tcp -t 1
+	$0 4 udp -t 1
+	$0 6 udp -t 1
 	echo "OK. All tests passed"
 	exit 0
 fi
@@ -68,22 +70,21 @@ case "${TXMODE}" in
 esac
 
 # Start of state changes: install cleanup handler
-save_sysctl_mem="$(sysctl -n ${path_sysctl_mem})"
 
 cleanup() {
 	ip netns del "${NS2}"
 	ip netns del "${NS1}"
-	sysctl -w -q "${path_sysctl_mem}=${save_sysctl_mem}"
 }
 
 trap cleanup EXIT
 
-# Configure system settings
-sysctl -w -q "${path_sysctl_mem}=1000000"
-
 # Create virtual ethernet pair between network namespaces
 ip netns add "${NS1}"
 ip netns add "${NS2}"
+
+# Configure system settings
+ip netns exec "${NS1}" sysctl -w -q "${path_sysctl_mem}=1000000"
+ip netns exec "${NS2}" sysctl -w -q "${path_sysctl_mem}=1000000"
 
 ip link add "${DEV}" mtu "${DEV_MTU}" netns "${NS1}" type veth \
   peer name "${DEV}" mtu "${DEV_MTU}" netns "${NS2}"

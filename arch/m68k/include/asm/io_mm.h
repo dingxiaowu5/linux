@@ -16,22 +16,22 @@
  *    isa_readX(),isa_writeX()  are for ISA memory
  */
 
-#ifndef _IO_H
-#define _IO_H
+#ifndef _M68K_IO_MM_H
+#define _M68K_IO_MM_H
 
 #ifdef __KERNEL__
-
-#define ARCH_HAS_IOREMAP_WT
 
 #include <linux/compiler.h>
 #include <asm/raw_io.h>
 #include <asm/virtconvert.h>
 #include <asm/kmap.h>
 
-#include <asm-generic/iomap.h>
-
 #ifdef CONFIG_ATARI
-#include <asm/atarihw.h>
+#define atari_readb   raw_inb
+#define atari_writeb  raw_outb
+
+#define atari_inb_p   raw_inb
+#define atari_outb_p  raw_outb
 #endif
 
 
@@ -272,20 +272,20 @@ static inline void isa_delay(void)
 #define isa_outsb(port, buf, nr) raw_outsb(isa_itb(port), (u8 *)(buf), (nr))
 
 #define isa_insw(port, buf, nr)     \
-       (ISA_SEX ? raw_insw(isa_itw(port), (u16 *)(buf), (nr)) :    \
-                  raw_insw_swapw(isa_itw(port), (u16 *)(buf), (nr)))
+	(ISA_SEX ? raw_insw(isa_itw(port), (u16 *)(buf), (nr)) :    \
+		   raw_insw_swapw(isa_itw(port), (u16 *)(buf), (nr)))
 
 #define isa_outsw(port, buf, nr)    \
-       (ISA_SEX ? raw_outsw(isa_itw(port), (u16 *)(buf), (nr)) :  \
-                  raw_outsw_swapw(isa_itw(port), (u16 *)(buf), (nr)))
+	(ISA_SEX ? raw_outsw(isa_itw(port), (u16 *)(buf), (nr)) :  \
+		   raw_outsw_swapw(isa_itw(port), (u16 *)(buf), (nr)))
 
 #define isa_insl(port, buf, nr)     \
-       (ISA_SEX ? raw_insl(isa_itl(port), (u32 *)(buf), (nr)) :    \
-                  raw_insw_swapw(isa_itw(port), (u16 *)(buf), (nr)<<1))
+	(ISA_SEX ? raw_insl(isa_itl(port), (u32 *)(buf), (nr)) :    \
+		   raw_insw_swapw(isa_itw(port), (u16 *)(buf), (nr)<<1))
 
 #define isa_outsl(port, buf, nr)    \
-       (ISA_SEX ? raw_outsl(isa_itl(port), (u32 *)(buf), (nr)) :  \
-                  raw_outsw_swapw(isa_itw(port), (u16 *)(buf), (nr)<<1))
+	(ISA_SEX ? raw_outsl(isa_itl(port), (u32 *)(buf), (nr)) :  \
+		   raw_outsw_swapw(isa_itw(port), (u16 *)(buf), (nr)<<1))
 
 
 #ifdef CONFIG_ATARI_ROM_ISA
@@ -297,14 +297,14 @@ static inline void isa_delay(void)
 #define isa_rom_insb(port, buf, nr) raw_rom_insb(isa_itb(port), (u8 *)(buf), (nr))
 
 #define isa_rom_insw(port, buf, nr)     \
-       (ISA_SEX ? raw_rom_insw(isa_itw(port), (u16 *)(buf), (nr)) :    \
-		  raw_rom_insw_swapw(isa_itw(port), (u16 *)(buf), (nr)))
+	(ISA_SEX ? raw_rom_insw(isa_itw(port), (u16 *)(buf), (nr)) :    \
+		   raw_rom_insw_swapw(isa_itw(port), (u16 *)(buf), (nr)))
 
 #define isa_rom_outsb(port, buf, nr) raw_rom_outsb(isa_itb(port), (u8 *)(buf), (nr))
 
 #define isa_rom_outsw(port, buf, nr)    \
-       (ISA_SEX ? raw_rom_outsw(isa_itw(port), (u16 *)(buf), (nr)) :  \
-		  raw_rom_outsw_swapw(isa_itw(port), (u16 *)(buf), (nr)))
+	(ISA_SEX ? raw_rom_outsw(isa_itw(port), (u16 *)(buf), (nr)) :  \
+		   raw_rom_outsw_swapw(isa_itw(port), (u16 *)(buf), (nr)))
 #endif /* CONFIG_ATARI_ROM_ISA */
 
 #endif  /* CONFIG_ISA || CONFIG_ATARI_ROM_ISA */
@@ -369,40 +369,6 @@ static inline void isa_delay(void)
 #define writew(val, addr)	out_le16((addr), (val))
 #endif /* CONFIG_ATARI_ROM_ISA */
 
-#if !defined(CONFIG_ISA) && !defined(CONFIG_ATARI_ROM_ISA)
-/*
- * We need to define dummy functions for GENERIC_IOMAP support.
- */
-#define inb(port)          0xff
-#define inb_p(port)        0xff
-#define outb(val,port)     ((void)0)
-#define outb_p(val,port)   ((void)0)
-#define inw(port)          0xffff
-#define inw_p(port)        0xffff
-#define outw(val,port)     ((void)0)
-#define outw_p(val,port)   ((void)0)
-#define inl(port)          0xffffffffUL
-#define inl_p(port)        0xffffffffUL
-#define outl(val,port)     ((void)0)
-#define outl_p(val,port)   ((void)0)
-
-#define insb(port,buf,nr)  ((void)0)
-#define outsb(port,buf,nr) ((void)0)
-#define insw(port,buf,nr)  ((void)0)
-#define outsw(port,buf,nr) ((void)0)
-#define insl(port,buf,nr)  ((void)0)
-#define outsl(port,buf,nr) ((void)0)
-
-/*
- * These should be valid on any ioremap()ed region
- */
-#define readb(addr)      in_8(addr)
-#define writeb(val,addr) out_8((addr),(val))
-#define readw(addr)      in_le16(addr)
-#define writew(val,addr) out_le16((addr),(val))
-
-#endif /* !CONFIG_ISA && !CONFIG_ATARI_ROM_ISA */
-
 #define readl(addr)      in_le32(addr)
 #define writel(val,addr) out_le32((addr),(val))
 
@@ -412,8 +378,6 @@ static inline void isa_delay(void)
 #define writesb(port, buf, nr)    raw_outsb((port), (u8 *)(buf), (nr))
 #define writesw(port, buf, nr)    raw_outsw((port), (u16 *)(buf), (nr))
 #define writesl(port, buf, nr)    raw_outsl((port), (u32 *)(buf), (nr))
-
-#define mmiowb()
 
 #ifndef CONFIG_SUN3
 #define IO_SPACE_LIMIT 0xffff
@@ -425,17 +389,6 @@ static inline void isa_delay(void)
 
 #define __ARCH_HAS_NO_PAGE_ZERO_MAPPED		1
 
-/*
- * Convert a physical pointer to a virtual kernel pointer for /dev/mem
- * access
- */
-#define xlate_dev_mem_ptr(p)	__va(p)
-
-/*
- * Convert a virtual cached pointer to an uncached pointer
- */
-#define xlate_dev_kmem_ptr(p)	p
-
 #define readb_relaxed(addr)	readb(addr)
 #define readw_relaxed(addr)	readw(addr)
 #define readl_relaxed(addr)	readl(addr)
@@ -444,4 +397,4 @@ static inline void isa_delay(void)
 #define writew_relaxed(b, addr)	writew(b, addr)
 #define writel_relaxed(b, addr)	writel(b, addr)
 
-#endif /* _IO_H */
+#endif /* _M68K_IO_MM_H */

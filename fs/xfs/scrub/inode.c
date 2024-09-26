@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Copyright (C) 2017 Oracle.  All Rights Reserved.
- * Author: Darrick J. Wong <darrick.wong@oracle.com>
+ * Copyright (C) 2017-2023 Oracle.  All Rights Reserved.
+ * Author: Darrick J. Wong <djwong@kernel.org>
  */
 #include "xfs.h"
 #include "xfs_fs.h"
@@ -9,86 +9,233 @@
 #include "xfs_format.h"
 #include "xfs_trans_resv.h"
 #include "xfs_mount.h"
-#include "xfs_defer.h"
 #include "xfs_btree.h"
-#include "xfs_bit.h"
 #include "xfs_log_format.h"
 #include "xfs_trans.h"
-#include "xfs_sb.h"
+#include "xfs_ag.h"
 #include "xfs_inode.h"
-#include "xfs_icache.h"
-#include "xfs_inode_buf.h"
-#include "xfs_inode_fork.h"
 #include "xfs_ialloc.h"
+#include "xfs_icache.h"
 #include "xfs_da_format.h"
 #include "xfs_reflink.h"
 #include "xfs_rmap.h"
-#include "xfs_bmap.h"
 #include "xfs_bmap_util.h"
-#include "scrub/xfs_scrub.h"
+#include "xfs_rtbitmap.h"
 #include "scrub/scrub.h"
 #include "scrub/common.h"
 #include "scrub/btree.h"
 #include "scrub/trace.h"
+#include "scrub/repair.h"
+
+/* Prepare the attached inode for scrubbing. */
+static inline int
+xchk_prepare_iscrub(
+	struct xfs_scrub	*sc)
+{
+	int			error;
+
+	xchk_ilock(sc, XFS_IOLOCK_EXCL);
+
+	error = xchk_trans_alloc(sc, 0);
+	if (error)
+		return error;
+
+	error = xchk_ino_dqattach(sc);
+	if (error)
+		return error;
+
+	xchk_ilock(sc, XFS_ILOCK_EXCL);
+	return 0;
+}
+
+/* Install this scrub-by-handle inode and prepare it for scrubbing. */
+static inline int
+xchk_install_handle_iscrub(
+	struct xfs_scrub	*sc,
+	struct xfs_inode	*ip)
+{
+	int			error;
+
+	error = xchk_install_handle_inode(sc, ip);
+	if (error)
+		return error;
+
+	return xchk_prepare_iscrub(sc);
+}
 
 /*
- * Grab total control of the inode metadata.  It doesn't matter here if
- * the file data is still changing; exclusive access to the metadata is
- * the goal.
+ * Grab total control of the inode metadata.  In the best case, we grab the
+ * incore inode and take all locks on it.  If the incore inode cannot be
+ * constructed due to corruption problems, lock the AGI so that we can single
+ * step the loading process to fix everything that can go wrong.
  */
 int
-xfs_scrub_setup_inode(
-	struct xfs_scrub_context	*sc,
-	struct xfs_inode		*ip)
+xchk_setup_inode(
+	struct xfs_scrub	*sc)
 {
-	int				error;
+	struct xfs_imap		imap;
+	struct xfs_inode	*ip;
+	struct xfs_mount	*mp = sc->mp;
+	struct xfs_inode	*ip_in = XFS_I(file_inode(sc->file));
+	struct xfs_buf		*agi_bp;
+	struct xfs_perag	*pag;
+	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, sc->sm->sm_ino);
+	int			error;
 
-	/*
-	 * Try to get the inode.  If the verifiers fail, we try again
-	 * in raw mode.
-	 */
-	error = xfs_scrub_get_inode(sc, ip);
-	switch (error) {
-	case 0:
-		break;
-	case -EFSCORRUPTED:
-	case -EFSBADCRC:
-		return xfs_scrub_trans_alloc(sc, 0);
-	default:
-		return error;
+	if (xchk_need_intent_drain(sc))
+		xchk_fsgates_enable(sc, XCHK_FSGATES_DRAIN);
+
+	/* We want to scan the opened inode, so lock it and exit. */
+	if (sc->sm->sm_ino == 0 || sc->sm->sm_ino == ip_in->i_ino) {
+		error = xchk_install_live_inode(sc, ip_in);
+		if (error)
+			return error;
+
+		return xchk_prepare_iscrub(sc);
 	}
 
-	/* Got the inode, lock it and we're ready to go. */
-	sc->ilock_flags = XFS_IOLOCK_EXCL | XFS_MMAPLOCK_EXCL;
-	xfs_ilock(sc->ip, sc->ilock_flags);
-	error = xfs_scrub_trans_alloc(sc, 0);
-	if (error)
-		goto out;
-	sc->ilock_flags |= XFS_ILOCK_EXCL;
-	xfs_ilock(sc->ip, XFS_ILOCK_EXCL);
+	/* Reject internal metadata files and obviously bad inode numbers. */
+	if (xfs_internal_inum(mp, sc->sm->sm_ino))
+		return -ENOENT;
+	if (!xfs_verify_ino(sc->mp, sc->sm->sm_ino))
+		return -ENOENT;
 
-out:
-	/* scrub teardown will unlock and release the inode for us */
+	/* Try a safe untrusted iget. */
+	error = xchk_iget_safe(sc, sc->sm->sm_ino, &ip);
+	if (!error)
+		return xchk_install_handle_iscrub(sc, ip);
+	if (error == -ENOENT)
+		return error;
+	if (error != -EFSCORRUPTED && error != -EFSBADCRC && error != -EINVAL)
+		goto out_error;
+
+	/*
+	 * EINVAL with IGET_UNTRUSTED probably means one of several things:
+	 * userspace gave us an inode number that doesn't correspond to fs
+	 * space; the inode btree lacks a record for this inode; or there is
+	 * a record, and it says this inode is free.
+	 *
+	 * EFSCORRUPTED/EFSBADCRC could mean that the inode was mappable, but
+	 * some other metadata corruption (e.g. inode forks) prevented
+	 * instantiation of the incore inode.  Or it could mean the inobt is
+	 * corrupt.
+	 *
+	 * We want to look up this inode in the inobt directly to distinguish
+	 * three different scenarios: (1) the inobt says the inode is free,
+	 * in which case there's nothing to do; (2) the inobt is corrupt so we
+	 * should flag the corruption and exit to userspace to let it fix the
+	 * inobt; and (3) the inobt says the inode is allocated, but loading it
+	 * failed due to corruption.
+	 *
+	 * Allocate a transaction and grab the AGI to prevent inobt activity in
+	 * this AG.  Retry the iget in case someone allocated a new inode after
+	 * the first iget failed.
+	 */
+	error = xchk_trans_alloc(sc, 0);
+	if (error)
+		goto out_error;
+
+	error = xchk_iget_agi(sc, sc->sm->sm_ino, &agi_bp, &ip);
+	if (error == 0) {
+		/* Actually got the incore inode, so install it and proceed. */
+		xchk_trans_cancel(sc);
+		return xchk_install_handle_iscrub(sc, ip);
+	}
+	if (error == -ENOENT)
+		goto out_gone;
+	if (error != -EFSCORRUPTED && error != -EFSBADCRC && error != -EINVAL)
+		goto out_cancel;
+
+	/* Ensure that we have protected against inode allocation/freeing. */
+	if (agi_bp == NULL) {
+		ASSERT(agi_bp != NULL);
+		error = -ECANCELED;
+		goto out_cancel;
+	}
+
+	/*
+	 * Untrusted iget failed a second time.  Let's try an inobt lookup.
+	 * If the inobt doesn't think this is an allocated inode then we'll
+	 * return ENOENT to signal that the check can be skipped.
+	 *
+	 * If the lookup signals corruption, we'll mark this inode corrupt and
+	 * exit to userspace.  There's little chance of fixing anything until
+	 * the inobt is straightened out, but there's nothing we can do here.
+	 *
+	 * If the lookup encounters a runtime error, exit to userspace.
+	 */
+	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, sc->sm->sm_ino));
+	if (!pag) {
+		error = -EFSCORRUPTED;
+		goto out_cancel;
+	}
+
+	error = xfs_imap(pag, sc->tp, sc->sm->sm_ino, &imap,
+			XFS_IGET_UNTRUSTED);
+	xfs_perag_put(pag);
+	if (error == -EINVAL || error == -ENOENT)
+		goto out_gone;
+	if (error)
+		goto out_cancel;
+
+	/*
+	 * The lookup succeeded.  Chances are the ondisk inode is corrupt and
+	 * preventing iget from reading it.  Retain the scrub transaction and
+	 * the AGI buffer to prevent anyone from allocating or freeing inodes.
+	 * This ensures that we preserve the inconsistency between the inobt
+	 * saying the inode is allocated and the icache being unable to load
+	 * the inode until we can flag the corruption in xchk_inode.  The
+	 * scrub function has to note the corruption, since we're not really
+	 * supposed to do that from the setup function.  Save the mapping to
+	 * make repairs to the ondisk inode buffer.
+	 */
+	if (xchk_could_repair(sc))
+		xrep_setup_inode(sc, &imap);
+	return 0;
+
+out_cancel:
+	xchk_trans_cancel(sc);
+out_error:
+	trace_xchk_op_error(sc, agno, XFS_INO_TO_AGBNO(mp, sc->sm->sm_ino),
+			error, __return_address);
 	return error;
+out_gone:
+	/* The file is gone, so there's nothing to check. */
+	xchk_trans_cancel(sc);
+	return -ENOENT;
 }
 
 /* Inode core */
 
 /* Validate di_extsize hint. */
 STATIC void
-xfs_scrub_inode_extsize(
-	struct xfs_scrub_context	*sc,
-	struct xfs_dinode		*dip,
-	xfs_ino_t			ino,
-	uint16_t			mode,
-	uint16_t			flags)
+xchk_inode_extsize(
+	struct xfs_scrub	*sc,
+	struct xfs_dinode	*dip,
+	xfs_ino_t		ino,
+	uint16_t		mode,
+	uint16_t		flags)
 {
-	xfs_failaddr_t			fa;
+	xfs_failaddr_t		fa;
+	uint32_t		value = be32_to_cpu(dip->di_extsize);
 
-	fa = xfs_inode_validate_extsize(sc->mp, be32_to_cpu(dip->di_extsize),
-			mode, flags);
+	fa = xfs_inode_validate_extsize(sc->mp, value, mode, flags);
 	if (fa)
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
+
+	/*
+	 * XFS allows a sysadmin to change the rt extent size when adding a rt
+	 * section to a filesystem after formatting.  If there are any
+	 * directories with extszinherit and rtinherit set, the hint could
+	 * become misaligned with the new rextsize.  The verifier doesn't check
+	 * this, because we allow rtinherit directories even without an rt
+	 * device.  Flag this as an administrative warning since we will clean
+	 * this up eventually.
+	 */
+	if ((flags & XFS_DIFLAG_RTINHERIT) &&
+	    (flags & XFS_DIFLAG_EXTSZINHERIT) &&
+	    xfs_extlen_to_rtxmod(sc->mp, value) > 0)
+		xchk_ino_set_warning(sc, ino);
 }
 
 /*
@@ -98,40 +245,40 @@ xfs_scrub_inode_extsize(
  * These functions must be kept in sync with each other.
  */
 STATIC void
-xfs_scrub_inode_cowextsize(
-	struct xfs_scrub_context	*sc,
-	struct xfs_dinode		*dip,
-	xfs_ino_t			ino,
-	uint16_t			mode,
-	uint16_t			flags,
-	uint64_t			flags2)
+xchk_inode_cowextsize(
+	struct xfs_scrub	*sc,
+	struct xfs_dinode	*dip,
+	xfs_ino_t		ino,
+	uint16_t		mode,
+	uint16_t		flags,
+	uint64_t		flags2)
 {
-	xfs_failaddr_t			fa;
+	xfs_failaddr_t		fa;
 
 	fa = xfs_inode_validate_cowextsize(sc->mp,
 			be32_to_cpu(dip->di_cowextsize), mode, flags,
 			flags2);
 	if (fa)
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
 }
 
 /* Make sure the di_flags make sense for the inode. */
 STATIC void
-xfs_scrub_inode_flags(
-	struct xfs_scrub_context	*sc,
-	struct xfs_dinode		*dip,
-	xfs_ino_t			ino,
-	uint16_t			mode,
-	uint16_t			flags)
+xchk_inode_flags(
+	struct xfs_scrub	*sc,
+	struct xfs_dinode	*dip,
+	xfs_ino_t		ino,
+	uint16_t		mode,
+	uint16_t		flags)
 {
-	struct xfs_mount		*mp = sc->mp;
+	struct xfs_mount	*mp = sc->mp;
 
+	/* di_flags are all taken, last bit cannot be used */
 	if (flags & ~XFS_DIFLAG_ANY)
 		goto bad;
 
 	/* rt flags require rt device */
-	if ((flags & (XFS_DIFLAG_REALTIME | XFS_DIFLAG_RTINHERIT)) &&
-	    !mp->m_rtdev_targp)
+	if ((flags & XFS_DIFLAG_REALTIME) && !mp->m_rtdev_targp)
 		goto bad;
 
 	/* new rt bitmap flag only valid for rbmino */
@@ -157,27 +304,28 @@ xfs_scrub_inode_flags(
 
 	return;
 bad:
-	xfs_scrub_ino_set_corrupt(sc, ino);
+	xchk_ino_set_corrupt(sc, ino);
 }
 
 /* Make sure the di_flags2 make sense for the inode. */
 STATIC void
-xfs_scrub_inode_flags2(
-	struct xfs_scrub_context	*sc,
-	struct xfs_dinode		*dip,
-	xfs_ino_t			ino,
-	uint16_t			mode,
-	uint16_t			flags,
-	uint64_t			flags2)
+xchk_inode_flags2(
+	struct xfs_scrub	*sc,
+	struct xfs_dinode	*dip,
+	xfs_ino_t		ino,
+	uint16_t		mode,
+	uint16_t		flags,
+	uint64_t		flags2)
 {
-	struct xfs_mount		*mp = sc->mp;
+	struct xfs_mount	*mp = sc->mp;
 
+	/* Unknown di_flags2 could be from a future kernel */
 	if (flags2 & ~XFS_DIFLAG2_ANY)
-		goto bad;
+		xchk_ino_set_warning(sc, ino);
 
 	/* reflink flag requires reflink feature */
 	if ((flags2 & XFS_DIFLAG2_REFLINK) &&
-	    !xfs_sb_version_hasreflink(&mp->m_sb))
+	    !xfs_has_reflink(mp))
 		goto bad;
 
 	/* cowextsize flag is checked w.r.t. mode separately */
@@ -194,29 +342,49 @@ xfs_scrub_inode_flags2(
 	if ((flags & XFS_DIFLAG_REALTIME) && (flags2 & XFS_DIFLAG2_REFLINK))
 		goto bad;
 
-	/* dax and reflink make no sense, currently */
-	if ((flags2 & XFS_DIFLAG2_DAX) && (flags2 & XFS_DIFLAG2_REFLINK))
+	/* no bigtime iflag without the bigtime feature */
+	if (xfs_dinode_has_bigtime(dip) && !xfs_has_bigtime(mp))
+		goto bad;
+
+	/* no large extent counts without the filesystem feature */
+	if ((flags2 & XFS_DIFLAG2_NREXT64) && !xfs_has_large_extent_counts(mp))
 		goto bad;
 
 	return;
 bad:
-	xfs_scrub_ino_set_corrupt(sc, ino);
+	xchk_ino_set_corrupt(sc, ino);
+}
+
+static inline void
+xchk_dinode_nsec(
+	struct xfs_scrub	*sc,
+	xfs_ino_t		ino,
+	struct xfs_dinode	*dip,
+	const xfs_timestamp_t	ts)
+{
+	struct timespec64	tv;
+
+	tv = xfs_inode_from_disk_ts(dip, ts);
+	if (tv.tv_nsec < 0 || tv.tv_nsec >= NSEC_PER_SEC)
+		xchk_ino_set_corrupt(sc, ino);
 }
 
 /* Scrub all the ondisk inode fields. */
 STATIC void
-xfs_scrub_dinode(
-	struct xfs_scrub_context	*sc,
-	struct xfs_dinode		*dip,
-	xfs_ino_t			ino)
+xchk_dinode(
+	struct xfs_scrub	*sc,
+	struct xfs_dinode	*dip,
+	xfs_ino_t		ino)
 {
-	struct xfs_mount		*mp = sc->mp;
-	size_t				fork_recs;
-	unsigned long long		isize;
-	uint64_t			flags2;
-	uint32_t			nextents;
-	uint16_t			flags;
-	uint16_t			mode;
+	struct xfs_mount	*mp = sc->mp;
+	size_t			fork_recs;
+	unsigned long long	isize;
+	uint64_t		flags2;
+	xfs_extnum_t		nextents;
+	xfs_extnum_t		naextents;
+	prid_t			prid;
+	uint16_t		flags;
+	uint16_t		mode;
 
 	flags = be16_to_cpu(dip->di_flags);
 	if (dip->di_version >= 3)
@@ -237,7 +405,7 @@ xfs_scrub_dinode(
 		/* mode is recognized */
 		break;
 	default:
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
 		break;
 	}
 
@@ -248,24 +416,30 @@ xfs_scrub_dinode(
 		 * We autoconvert v1 inodes into v2 inodes on writeout,
 		 * so just mark this inode for preening.
 		 */
-		xfs_scrub_ino_set_preen(sc, ino);
+		xchk_ino_set_preen(sc, ino);
+		prid = 0;
 		break;
 	case 2:
 	case 3:
 		if (dip->di_onlink != 0)
-			xfs_scrub_ino_set_corrupt(sc, ino);
+			xchk_ino_set_corrupt(sc, ino);
 
 		if (dip->di_mode == 0 && sc->ip)
-			xfs_scrub_ino_set_corrupt(sc, ino);
+			xchk_ino_set_corrupt(sc, ino);
 
 		if (dip->di_projid_hi != 0 &&
-		    !xfs_sb_version_hasprojid32bit(&mp->m_sb))
-			xfs_scrub_ino_set_corrupt(sc, ino);
+		    !xfs_has_projid32(mp))
+			xchk_ino_set_corrupt(sc, ino);
+
+		prid = be16_to_cpu(dip->di_projid_lo);
 		break;
 	default:
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
 		return;
 	}
+
+	if (xfs_has_projid32(mp))
+		prid |= (prid_t)be16_to_cpu(dip->di_projid_hi) << 16;
 
 	/*
 	 * di_uid/di_gid -- -1 isn't invalid, but there's no way that
@@ -273,40 +447,44 @@ xfs_scrub_dinode(
 	 */
 	if (dip->di_uid == cpu_to_be32(-1U) ||
 	    dip->di_gid == cpu_to_be32(-1U))
-		xfs_scrub_ino_set_warning(sc, ino);
+		xchk_ino_set_warning(sc, ino);
+
+	/*
+	 * project id of -1 isn't supposed to be valid, but the kernel didn't
+	 * always validate that.
+	 */
+	if (prid == -1U)
+		xchk_ino_set_warning(sc, ino);
 
 	/* di_format */
 	switch (dip->di_format) {
 	case XFS_DINODE_FMT_DEV:
 		if (!S_ISCHR(mode) && !S_ISBLK(mode) &&
 		    !S_ISFIFO(mode) && !S_ISSOCK(mode))
-			xfs_scrub_ino_set_corrupt(sc, ino);
+			xchk_ino_set_corrupt(sc, ino);
 		break;
 	case XFS_DINODE_FMT_LOCAL:
 		if (!S_ISDIR(mode) && !S_ISLNK(mode))
-			xfs_scrub_ino_set_corrupt(sc, ino);
+			xchk_ino_set_corrupt(sc, ino);
 		break;
 	case XFS_DINODE_FMT_EXTENTS:
 		if (!S_ISREG(mode) && !S_ISDIR(mode) && !S_ISLNK(mode))
-			xfs_scrub_ino_set_corrupt(sc, ino);
+			xchk_ino_set_corrupt(sc, ino);
 		break;
 	case XFS_DINODE_FMT_BTREE:
 		if (!S_ISREG(mode) && !S_ISDIR(mode))
-			xfs_scrub_ino_set_corrupt(sc, ino);
+			xchk_ino_set_corrupt(sc, ino);
 		break;
 	case XFS_DINODE_FMT_UUID:
 	default:
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
 		break;
 	}
 
 	/* di_[amc]time.nsec */
-	if (be32_to_cpu(dip->di_atime.t_nsec) >= NSEC_PER_SEC)
-		xfs_scrub_ino_set_corrupt(sc, ino);
-	if (be32_to_cpu(dip->di_mtime.t_nsec) >= NSEC_PER_SEC)
-		xfs_scrub_ino_set_corrupt(sc, ino);
-	if (be32_to_cpu(dip->di_ctime.t_nsec) >= NSEC_PER_SEC)
-		xfs_scrub_ino_set_corrupt(sc, ino);
+	xchk_dinode_nsec(sc, ino, dip, dip->di_atime);
+	xchk_dinode_nsec(sc, ino, dip, dip->di_mtime);
+	xchk_dinode_nsec(sc, ino, dip, dip->di_ctime);
 
 	/*
 	 * di_size.  xfs_dinode_verify checks for things that screw up
@@ -315,19 +493,19 @@ xfs_scrub_dinode(
 	 */
 	isize = be64_to_cpu(dip->di_size);
 	if (isize & (1ULL << 63))
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
 
 	/* Devices, fifos, and sockets must have zero size */
 	if (!S_ISDIR(mode) && !S_ISREG(mode) && !S_ISLNK(mode) && isize != 0)
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
 
 	/* Directories can't be larger than the data section size (32G) */
 	if (S_ISDIR(mode) && (isize == 0 || isize >= XFS_DIR2_SPACE_SIZE))
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
 
 	/* Symlinks can't be larger than SYMLINK_MAXLEN */
 	if (S_ISLNK(mode) && (isize == 0 || isize >= XFS_SYMLINK_MAXLEN))
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
 
 	/*
 	 * Warn if the running kernel can't handle the kinds of offsets
@@ -335,8 +513,8 @@ xfs_scrub_dinode(
 	 * pagecache can't cache all the blocks in this file due to
 	 * overly large offsets, flag the inode for admin review.
 	 */
-	if (isize >= mp->m_super->s_maxbytes)
-		xfs_scrub_ino_set_warning(sc, ino);
+	if (isize > mp->m_super->s_maxbytes)
+		xchk_ino_set_warning(sc, ino);
 
 	/* di_nblocks */
 	if (flags2 & XFS_DIFLAG2_REFLINK) {
@@ -351,70 +529,70 @@ xfs_scrub_dinode(
 		 */
 		if (be64_to_cpu(dip->di_nblocks) >=
 		    mp->m_sb.sb_dblocks + mp->m_sb.sb_rblocks)
-			xfs_scrub_ino_set_corrupt(sc, ino);
+			xchk_ino_set_corrupt(sc, ino);
 	} else {
 		if (be64_to_cpu(dip->di_nblocks) >= mp->m_sb.sb_dblocks)
-			xfs_scrub_ino_set_corrupt(sc, ino);
+			xchk_ino_set_corrupt(sc, ino);
 	}
 
-	xfs_scrub_inode_flags(sc, dip, ino, mode, flags);
+	xchk_inode_flags(sc, dip, ino, mode, flags);
 
-	xfs_scrub_inode_extsize(sc, dip, ino, mode, flags);
+	xchk_inode_extsize(sc, dip, ino, mode, flags);
+
+	nextents = xfs_dfork_data_extents(dip);
+	naextents = xfs_dfork_attr_extents(dip);
 
 	/* di_nextents */
-	nextents = be32_to_cpu(dip->di_nextents);
 	fork_recs =  XFS_DFORK_DSIZE(dip, mp) / sizeof(struct xfs_bmbt_rec);
 	switch (dip->di_format) {
 	case XFS_DINODE_FMT_EXTENTS:
 		if (nextents > fork_recs)
-			xfs_scrub_ino_set_corrupt(sc, ino);
+			xchk_ino_set_corrupt(sc, ino);
 		break;
 	case XFS_DINODE_FMT_BTREE:
 		if (nextents <= fork_recs)
-			xfs_scrub_ino_set_corrupt(sc, ino);
+			xchk_ino_set_corrupt(sc, ino);
 		break;
 	default:
 		if (nextents != 0)
-			xfs_scrub_ino_set_corrupt(sc, ino);
+			xchk_ino_set_corrupt(sc, ino);
 		break;
 	}
 
 	/* di_forkoff */
-	if (XFS_DFORK_APTR(dip) >= (char *)dip + mp->m_sb.sb_inodesize)
-		xfs_scrub_ino_set_corrupt(sc, ino);
-	if (dip->di_anextents != 0 && dip->di_forkoff == 0)
-		xfs_scrub_ino_set_corrupt(sc, ino);
+	if (XFS_DFORK_BOFF(dip) >= mp->m_sb.sb_inodesize)
+		xchk_ino_set_corrupt(sc, ino);
+	if (naextents != 0 && dip->di_forkoff == 0)
+		xchk_ino_set_corrupt(sc, ino);
 	if (dip->di_forkoff == 0 && dip->di_aformat != XFS_DINODE_FMT_EXTENTS)
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
 
 	/* di_aformat */
 	if (dip->di_aformat != XFS_DINODE_FMT_LOCAL &&
 	    dip->di_aformat != XFS_DINODE_FMT_EXTENTS &&
 	    dip->di_aformat != XFS_DINODE_FMT_BTREE)
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
 
 	/* di_anextents */
-	nextents = be16_to_cpu(dip->di_anextents);
 	fork_recs =  XFS_DFORK_ASIZE(dip, mp) / sizeof(struct xfs_bmbt_rec);
 	switch (dip->di_aformat) {
 	case XFS_DINODE_FMT_EXTENTS:
-		if (nextents > fork_recs)
-			xfs_scrub_ino_set_corrupt(sc, ino);
+		if (naextents > fork_recs)
+			xchk_ino_set_corrupt(sc, ino);
 		break;
 	case XFS_DINODE_FMT_BTREE:
-		if (nextents <= fork_recs)
-			xfs_scrub_ino_set_corrupt(sc, ino);
+		if (naextents <= fork_recs)
+			xchk_ino_set_corrupt(sc, ino);
 		break;
 	default:
-		if (nextents != 0)
-			xfs_scrub_ino_set_corrupt(sc, ino);
+		if (naextents != 0)
+			xchk_ino_set_corrupt(sc, ino);
 	}
 
 	if (dip->di_version >= 3) {
-		if (be32_to_cpu(dip->di_crtime.t_nsec) >= NSEC_PER_SEC)
-			xfs_scrub_ino_set_corrupt(sc, ino);
-		xfs_scrub_inode_flags2(sc, dip, ino, mode, flags, flags2);
-		xfs_scrub_inode_cowextsize(sc, dip, ino, mode, flags,
+		xchk_dinode_nsec(sc, ino, dip, dip->di_crtime);
+		xchk_inode_flags2(sc, dip, ino, mode, flags, flags2);
+		xchk_inode_cowextsize(sc, dip, ino, mode, flags,
 				flags2);
 	}
 }
@@ -425,8 +603,8 @@ xfs_scrub_dinode(
  * IGET_UNTRUSTED, which checks the inobt for us.
  */
 static void
-xfs_scrub_inode_xref_finobt(
-	struct xfs_scrub_context	*sc,
+xchk_inode_xref_finobt(
+	struct xfs_scrub		*sc,
 	xfs_ino_t			ino)
 {
 	struct xfs_inobt_rec_incore	rec;
@@ -434,7 +612,7 @@ xfs_scrub_inode_xref_finobt(
 	int				has_record;
 	int				error;
 
-	if (!sc->sa.fino_cur || xfs_scrub_skip_xref(sc->sm))
+	if (!sc->sa.fino_cur || xchk_skip_xref(sc->sm))
 		return;
 
 	agino = XFS_INO_TO_AGINO(sc->mp, ino);
@@ -445,12 +623,12 @@ xfs_scrub_inode_xref_finobt(
 	 */
 	error = xfs_inobt_lookup(sc->sa.fino_cur, agino, XFS_LOOKUP_LE,
 			&has_record);
-	if (!xfs_scrub_should_check_xref(sc, &error, &sc->sa.fino_cur) ||
+	if (!xchk_should_check_xref(sc, &error, &sc->sa.fino_cur) ||
 	    !has_record)
 		return;
 
 	error = xfs_inobt_get_rec(sc->sa.fino_cur, &rec, &has_record);
-	if (!xfs_scrub_should_check_xref(sc, &error, &sc->sa.fino_cur) ||
+	if (!xchk_should_check_xref(sc, &error, &sc->sa.fino_cur) ||
 	    !has_record)
 		return;
 
@@ -463,54 +641,53 @@ xfs_scrub_inode_xref_finobt(
 		return;
 
 	if (rec.ir_free & XFS_INOBT_MASK(agino - rec.ir_startino))
-		xfs_scrub_btree_xref_set_corrupt(sc, sc->sa.fino_cur, 0);
+		xchk_btree_xref_set_corrupt(sc, sc->sa.fino_cur, 0);
 }
 
 /* Cross reference the inode fields with the forks. */
 STATIC void
-xfs_scrub_inode_xref_bmap(
-	struct xfs_scrub_context	*sc,
-	struct xfs_dinode		*dip)
+xchk_inode_xref_bmap(
+	struct xfs_scrub	*sc,
+	struct xfs_dinode	*dip)
 {
-	xfs_extnum_t			nextents;
-	xfs_filblks_t			count;
-	xfs_filblks_t			acount;
-	int				error;
+	xfs_extnum_t		nextents;
+	xfs_filblks_t		count;
+	xfs_filblks_t		acount;
+	int			error;
 
-	if (xfs_scrub_skip_xref(sc->sm))
+	if (xchk_skip_xref(sc->sm))
 		return;
 
 	/* Walk all the extents to check nextents/naextents/nblocks. */
 	error = xfs_bmap_count_blocks(sc->tp, sc->ip, XFS_DATA_FORK,
 			&nextents, &count);
-	if (!xfs_scrub_should_check_xref(sc, &error, NULL))
+	if (!xchk_should_check_xref(sc, &error, NULL))
 		return;
-	if (nextents < be32_to_cpu(dip->di_nextents))
-		xfs_scrub_ino_xref_set_corrupt(sc, sc->ip->i_ino);
+	if (nextents < xfs_dfork_data_extents(dip))
+		xchk_ino_xref_set_corrupt(sc, sc->ip->i_ino);
 
 	error = xfs_bmap_count_blocks(sc->tp, sc->ip, XFS_ATTR_FORK,
 			&nextents, &acount);
-	if (!xfs_scrub_should_check_xref(sc, &error, NULL))
+	if (!xchk_should_check_xref(sc, &error, NULL))
 		return;
-	if (nextents != be16_to_cpu(dip->di_anextents))
-		xfs_scrub_ino_xref_set_corrupt(sc, sc->ip->i_ino);
+	if (nextents != xfs_dfork_attr_extents(dip))
+		xchk_ino_xref_set_corrupt(sc, sc->ip->i_ino);
 
 	/* Check nblocks against the inode. */
 	if (count + acount != be64_to_cpu(dip->di_nblocks))
-		xfs_scrub_ino_xref_set_corrupt(sc, sc->ip->i_ino);
+		xchk_ino_xref_set_corrupt(sc, sc->ip->i_ino);
 }
 
 /* Cross-reference with the other btrees. */
 STATIC void
-xfs_scrub_inode_xref(
-	struct xfs_scrub_context	*sc,
-	xfs_ino_t			ino,
-	struct xfs_dinode		*dip)
+xchk_inode_xref(
+	struct xfs_scrub	*sc,
+	xfs_ino_t		ino,
+	struct xfs_dinode	*dip)
 {
-	struct xfs_owner_info		oinfo;
-	xfs_agnumber_t			agno;
-	xfs_agblock_t			agbno;
-	int				error;
+	xfs_agnumber_t		agno;
+	xfs_agblock_t		agbno;
+	int			error;
 
 	if (sc->sm->sm_flags & XFS_SCRUB_OFLAG_CORRUPT)
 		return;
@@ -518,18 +695,19 @@ xfs_scrub_inode_xref(
 	agno = XFS_INO_TO_AGNO(sc->mp, ino);
 	agbno = XFS_INO_TO_AGBNO(sc->mp, ino);
 
-	error = xfs_scrub_ag_init(sc, agno, &sc->sa);
-	if (!xfs_scrub_xref_process_error(sc, agno, agbno, &error))
-		return;
+	error = xchk_ag_init_existing(sc, agno, &sc->sa);
+	if (!xchk_xref_process_error(sc, agno, agbno, &error))
+		goto out_free;
 
-	xfs_scrub_xref_is_used_space(sc, agbno, 1);
-	xfs_scrub_inode_xref_finobt(sc, ino);
-	xfs_rmap_ag_owner(&oinfo, XFS_RMAP_OWN_INODES);
-	xfs_scrub_xref_is_owned_by(sc, agbno, 1, &oinfo);
-	xfs_scrub_xref_is_not_shared(sc, agbno, 1);
-	xfs_scrub_inode_xref_bmap(sc, dip);
+	xchk_xref_is_used_space(sc, agbno, 1);
+	xchk_inode_xref_finobt(sc, ino);
+	xchk_xref_is_only_owned_by(sc, agbno, 1, &XFS_RMAP_OINFO_INODES);
+	xchk_xref_is_not_shared(sc, agbno, 1);
+	xchk_xref_is_not_cow_staging(sc, agbno, 1);
+	xchk_inode_xref_bmap(sc, dip);
 
-	xfs_scrub_ag_free(sc, &sc->sa);
+out_free:
+	xchk_ag_free(sc, &sc->sa);
 }
 
 /*
@@ -539,35 +717,52 @@ xfs_scrub_inode_xref(
  * reflink filesystem.
  */
 static void
-xfs_scrub_inode_check_reflink_iflag(
-	struct xfs_scrub_context	*sc,
-	xfs_ino_t			ino)
+xchk_inode_check_reflink_iflag(
+	struct xfs_scrub	*sc,
+	xfs_ino_t		ino)
 {
-	struct xfs_mount		*mp = sc->mp;
-	bool				has_shared;
-	int				error;
+	struct xfs_mount	*mp = sc->mp;
+	bool			has_shared;
+	int			error;
 
-	if (!xfs_sb_version_hasreflink(&mp->m_sb))
+	if (!xfs_has_reflink(mp))
 		return;
 
 	error = xfs_reflink_inode_has_shared_extents(sc->tp, sc->ip,
 			&has_shared);
-	if (!xfs_scrub_xref_process_error(sc, XFS_INO_TO_AGNO(mp, ino),
+	if (!xchk_xref_process_error(sc, XFS_INO_TO_AGNO(mp, ino),
 			XFS_INO_TO_AGBNO(mp, ino), &error))
 		return;
 	if (xfs_is_reflink_inode(sc->ip) && !has_shared)
-		xfs_scrub_ino_set_preen(sc, ino);
+		xchk_ino_set_preen(sc, ino);
 	else if (!xfs_is_reflink_inode(sc->ip) && has_shared)
-		xfs_scrub_ino_set_corrupt(sc, ino);
+		xchk_ino_set_corrupt(sc, ino);
+}
+
+/*
+ * If this inode has zero link count, it must be on the unlinked list.  If
+ * it has nonzero link count, it must not be on the unlinked list.
+ */
+STATIC void
+xchk_inode_check_unlinked(
+	struct xfs_scrub	*sc)
+{
+	if (VFS_I(sc->ip)->i_nlink == 0) {
+		if (!xfs_inode_on_unlinked_list(sc->ip))
+			xchk_ino_set_corrupt(sc, sc->ip->i_ino);
+	} else {
+		if (xfs_inode_on_unlinked_list(sc->ip))
+			xchk_ino_set_corrupt(sc, sc->ip->i_ino);
+	}
 }
 
 /* Scrub an inode. */
 int
-xfs_scrub_inode(
-	struct xfs_scrub_context	*sc)
+xchk_inode(
+	struct xfs_scrub	*sc)
 {
-	struct xfs_dinode		di;
-	int				error = 0;
+	struct xfs_dinode	di;
+	int			error = 0;
 
 	/*
 	 * If sc->ip is NULL, that means that the setup function called
@@ -575,13 +770,13 @@ xfs_scrub_inode(
 	 * and a NULL inode, so flag the corruption error and return.
 	 */
 	if (!sc->ip) {
-		xfs_scrub_ino_set_corrupt(sc, sc->sm->sm_ino);
+		xchk_ino_set_corrupt(sc, sc->sm->sm_ino);
 		return 0;
 	}
 
 	/* Scrub the inode core. */
 	xfs_inode_to_disk(sc->ip, &di, 0);
-	xfs_scrub_dinode(sc, &di, sc->ip->i_ino);
+	xchk_dinode(sc, &di, sc->ip->i_ino);
 	if (sc->sm->sm_flags & XFS_SCRUB_OFLAG_CORRUPT)
 		goto out;
 
@@ -591,9 +786,11 @@ xfs_scrub_inode(
 	 * we scrubbed the dinode.
 	 */
 	if (S_ISREG(VFS_I(sc->ip)->i_mode))
-		xfs_scrub_inode_check_reflink_iflag(sc, sc->ip->i_ino);
+		xchk_inode_check_reflink_iflag(sc, sc->ip->i_ino);
 
-	xfs_scrub_inode_xref(sc, sc->ip->i_ino, &di);
+	xchk_inode_check_unlinked(sc);
+
+	xchk_inode_xref(sc, sc->ip->i_ino, &di);
 out:
 	return error;
 }

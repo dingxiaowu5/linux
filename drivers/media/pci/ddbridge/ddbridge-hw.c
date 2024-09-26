@@ -1,19 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * ddbridge-hw.c: Digital Devices bridge hardware maps
  *
  * Copyright (C) 2010-2017 Digital Devices GmbH
  *                         Ralph Metzler <rjkm@metzlerbros.de>
  *                         Marcus Metzler <mocm@metzlerbros.de>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 only, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
  */
 
 #include "ddbridge.h"
@@ -318,7 +309,8 @@ static const struct ddb_info ddb_s2x_48 = {
 	.port_num = 4,
 	.i2c_mask = 0x00,
 	.tempmon_irq = 24,
-	.mci      = 4
+	.mci_ports = 4,
+	.mci_type = 0,
 };
 
 /****************************************************************************/

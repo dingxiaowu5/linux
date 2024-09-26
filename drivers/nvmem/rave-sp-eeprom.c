@@ -10,7 +10,7 @@
 #include <linux/mfd/rave-sp.h>
 #include <linux/module.h>
 #include <linux/nvmem-provider.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/sizes.h>
 
@@ -35,6 +35,7 @@ enum rave_sp_eeprom_header_size {
 	RAVE_SP_EEPROM_HEADER_SMALL = 4U,
 	RAVE_SP_EEPROM_HEADER_BIG   = 5U,
 };
+#define RAVE_SP_EEPROM_HEADER_MAX	RAVE_SP_EEPROM_HEADER_BIG
 
 #define	RAVE_SP_EEPROM_PAGE_SIZE	32U
 
@@ -44,7 +45,7 @@ enum rave_sp_eeprom_header_size {
  * @type:	Access type (see enum rave_sp_eeprom_access_type)
  * @success:	Success flag (Success = 1, Failure = 0)
  * @data:	Read data
-
+ *
  * Note this structure corresponds to RSP_*_EEPROM payload from RAVE
  * SP ICD
  */
@@ -97,8 +98,11 @@ static int rave_sp_eeprom_io(struct rave_sp_eeprom *eeprom,
 	const unsigned int rsp_size =
 		is_write ? sizeof(*page) - sizeof(page->data) : sizeof(*page);
 	unsigned int offset = 0;
-	u8 cmd[cmd_size];
+	u8 cmd[RAVE_SP_EEPROM_HEADER_MAX + sizeof(page->data)];
 	int ret;
+
+	if (WARN_ON(cmd_size > sizeof(cmd)))
+		return -EINVAL;
 
 	cmd[offset++] = eeprom->address;
 	cmd[offset++] = 0;
@@ -324,6 +328,7 @@ static int rave_sp_eeprom_probe(struct platform_device *pdev)
 	of_property_read_string(np, "zii,eeprom-name", &config.name);
 	config.priv		= eeprom;
 	config.dev		= dev;
+	config.add_legacy_fixed_of_cells	= true;
 	config.size		= size;
 	config.reg_read		= rave_sp_eeprom_reg_read;
 	config.reg_write	= rave_sp_eeprom_reg_write;

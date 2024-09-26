@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * CXL Flash Device Driver
  *
@@ -5,11 +6,6 @@
  *             Matthew R. Ochs <mrochs@linux.vnet.ibm.com>, IBM Corporation
  *
  * Copyright (C) 2015 IBM Corporation
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version
- * 2 of the License, or (at your option) any later version.
  */
 
 #include <linux/delay.h>
@@ -34,7 +30,7 @@ struct cxlflash_global global;
 
 /**
  * marshal_rele_to_resize() - translate release to resize structure
- * @rele:	Source structure from which to translate/copy.
+ * @release:	Source structure from which to translate/copy.
  * @resize:	Destination structure for the translate/copy.
  */
 static void marshal_rele_to_resize(struct dk_cxlflash_release *release,
@@ -48,7 +44,7 @@ static void marshal_rele_to_resize(struct dk_cxlflash_release *release,
 /**
  * marshal_det_to_rele() - translate detach to release structure
  * @detach:	Destination structure for the translate/copy.
- * @rele:	Source structure from which to translate/copy.
+ * @release:	Source structure from which to translate/copy.
  */
 static void marshal_det_to_rele(struct dk_cxlflash_detach *detach,
 				struct dk_cxlflash_release *release)
@@ -312,19 +308,19 @@ out:
  * @lli:	LUN destined for capacity request.
  *
  * The READ_CAP16 can take quite a while to complete. Should an EEH occur while
- * in scsi_execute(), the EEH handler will attempt to recover. As part of the
- * recovery, the handler drains all currently running ioctls, waiting until they
- * have completed before proceeding with a reset. As this routine is used on the
- * ioctl path, this can create a condition where the EEH handler becomes stuck,
- * infinitely waiting for this ioctl thread. To avoid this behavior, temporarily
- * unmark this thread as an ioctl thread by releasing the ioctl read semaphore.
- * This will allow the EEH handler to proceed with a recovery while this thread
- * is still running. Once the scsi_execute() returns, reacquire the ioctl read
- * semaphore and check the adapter state in case it changed while inside of
- * scsi_execute(). The state check will wait if the adapter is still being
- * recovered or return a failure if the recovery failed. In the event that the
- * adapter reset failed, simply return the failure as the ioctl would be unable
- * to continue.
+ * in scsi_execute_cmd(), the EEH handler will attempt to recover. As part of
+ * the recovery, the handler drains all currently running ioctls, waiting until
+ * they have completed before proceeding with a reset. As this routine is used
+ * on the ioctl path, this can create a condition where the EEH handler becomes
+ * stuck, infinitely waiting for this ioctl thread. To avoid this behavior,
+ * temporarily unmark this thread as an ioctl thread by releasing the ioctl
+ * read semaphore. This will allow the EEH handler to proceed with a recovery
+ * while this thread is still running. Once the scsi_execute_cmd() returns,
+ * reacquire the ioctl read semaphore and check the adapter state in case it
+ * changed while inside of scsi_execute_cmd(). The state check will wait if the
+ * adapter is still being recovered or return a failure if the recovery failed.
+ * In the event that the adapter reset failed, simply return the failure as the
+ * ioctl would be unable to continue.
  *
  * Note that the above puts a requirement on this routine to only be called on
  * an ioctl thread.
@@ -337,9 +333,11 @@ static int read_cap16(struct scsi_device *sdev, struct llun_info *lli)
 	struct device *dev = &cfg->dev->dev;
 	struct glun_info *gli = lli->parent;
 	struct scsi_sense_hdr sshdr;
+	const struct scsi_exec_args exec_args = {
+		.sshdr = &sshdr,
+	};
 	u8 *cmd_buf = NULL;
 	u8 *scsi_cmd = NULL;
-	u8 *sense_buf = NULL;
 	int rc = 0;
 	int result = 0;
 	int retry_cnt = 0;
@@ -348,8 +346,7 @@ static int read_cap16(struct scsi_device *sdev, struct llun_info *lli)
 retry:
 	cmd_buf = kzalloc(CMD_BUFSIZE, GFP_KERNEL);
 	scsi_cmd = kzalloc(MAX_COMMAND_SIZE, GFP_KERNEL);
-	sense_buf = kzalloc(SCSI_SENSE_BUFFERSIZE, GFP_KERNEL);
-	if (unlikely(!cmd_buf || !scsi_cmd || !sense_buf)) {
+	if (unlikely(!cmd_buf || !scsi_cmd)) {
 		rc = -ENOMEM;
 		goto out;
 	}
@@ -361,11 +358,10 @@ retry:
 	dev_dbg(dev, "%s: %ssending cmd(%02x)\n", __func__,
 		retry_cnt ? "re" : "", scsi_cmd[0]);
 
-	/* Drop the ioctl read semahpore across lengthy call */
+	/* Drop the ioctl read semaphore across lengthy call */
 	up_read(&cfg->ioctl_rwsem);
-	result = scsi_execute(sdev, scsi_cmd, DMA_FROM_DEVICE, cmd_buf,
-			      CMD_BUFSIZE, sense_buf, &sshdr, to, CMD_RETRIES,
-			      0, 0, NULL);
+	result = scsi_execute_cmd(sdev, scsi_cmd, REQ_OP_DRV_IN, cmd_buf,
+				  CMD_BUFSIZE, to, CMD_RETRIES, &exec_args);
 	down_read(&cfg->ioctl_rwsem);
 	rc = check_state(cfg);
 	if (rc) {
@@ -375,27 +371,24 @@ retry:
 		goto out;
 	}
 
-	if (driver_byte(result) == DRIVER_SENSE) {
-		result &= ~(0xFF<<24); /* DRIVER_SENSE is not an error */
+	if (result > 0 && scsi_sense_valid(&sshdr)) {
 		if (result & SAM_STAT_CHECK_CONDITION) {
 			switch (sshdr.sense_key) {
 			case NO_SENSE:
 			case RECOVERED_ERROR:
-				/* fall through */
 			case NOT_READY:
 				result &= ~SAM_STAT_CHECK_CONDITION;
 				break;
 			case UNIT_ATTENTION:
 				switch (sshdr.asc) {
 				case 0x29: /* Power on Reset or Device Reset */
-					/* fall through */
+					fallthrough;
 				case 0x2A: /* Device capacity changed */
 				case 0x3F: /* Report LUNs changed */
 					/* Retry the command once more */
 					if (retry_cnt++ < 1) {
 						kfree(cmd_buf);
 						kfree(scsi_cmd);
-						kfree(sense_buf);
 						goto retry;
 					}
 				}
@@ -426,7 +419,6 @@ retry:
 out:
 	kfree(cmd_buf);
 	kfree(scsi_cmd);
-	kfree(sense_buf);
 
 	dev_dbg(dev, "%s: maxlba=%lld blklen=%d rc=%d\n",
 		__func__, gli->max_lba, gli->blk_len, rc);
@@ -526,7 +518,7 @@ void rhte_checkin(struct ctx_info *ctxi,
 }
 
 /**
- * rhte_format1() - populates a RHTE for format 1
+ * rht_format1() - populates a RHTE for format 1
  * @rhte:	RHTE to populate.
  * @lun_id:	LUN ID of LUN associated with RHTE.
  * @perm:	Desired permissions for RHTE.
@@ -737,8 +729,7 @@ out:
 	return rc;
 }
 
-int cxlflash_disk_release(struct scsi_device *sdev,
-			  struct dk_cxlflash_release *release)
+int cxlflash_disk_release(struct scsi_device *sdev, void *release)
 {
 	return _cxlflash_disk_release(sdev, NULL, release);
 }
@@ -963,8 +954,7 @@ out:
 	return rc;
 }
 
-static int cxlflash_disk_detach(struct scsi_device *sdev,
-				struct dk_cxlflash_detach *detach)
+static int cxlflash_disk_detach(struct scsi_device *sdev, void *detach)
 {
 	return _cxlflash_disk_detach(sdev, NULL, detach);
 }
@@ -1108,7 +1098,7 @@ out:
  *
  * Return: 0 on success, VM_FAULT_SIGBUS on failure
  */
-static int cxlflash_mmap_fault(struct vm_fault *vmf)
+static vm_fault_t cxlflash_mmap_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct file *file = vma->vm_file;
@@ -1119,7 +1109,7 @@ static int cxlflash_mmap_fault(struct vm_fault *vmf)
 	struct ctx_info *ctxi = NULL;
 	struct page *err_page = NULL;
 	enum ctx_ctrl ctrl = CTX_CTRL_ERR_FALLBACK | CTX_CTRL_FILE;
-	int rc = 0;
+	vm_fault_t rc = 0;
 	int ctxid;
 
 	ctxid = cfg->ops->process_element(ctx);
@@ -1159,7 +1149,7 @@ static int cxlflash_mmap_fault(struct vm_fault *vmf)
 out:
 	if (likely(ctxi))
 		put_context(ctxi);
-	dev_dbg(dev, "%s: returning rc=%d\n", __func__, rc);
+	dev_dbg(dev, "%s: returning rc=%x\n", __func__, rc);
 	return rc;
 
 err:
@@ -1313,7 +1303,7 @@ retry:
 /**
  * cxlflash_disk_attach() - attach a LUN to a context
  * @sdev:	SCSI device associated with LUN.
- * @attach:	Attach ioctl data structure.
+ * @arg:	Attach ioctl data structure.
  *
  * Creates a context and attaches LUN to it. A LUN can only be attached
  * one time to a context (subsequent attaches for the same context/LUN pair
@@ -1322,9 +1312,9 @@ retry:
  *
  * Return: 0 on success, -errno on failure
  */
-static int cxlflash_disk_attach(struct scsi_device *sdev,
-				struct dk_cxlflash_attach *attach)
+static int cxlflash_disk_attach(struct scsi_device *sdev, void *arg)
 {
+	struct dk_cxlflash_attach *attach = arg;
 	struct cxlflash_cfg *cfg = shost_priv(sdev->host);
 	struct device *dev = &cfg->dev->dev;
 	struct afu *afu = cfg->afu;
@@ -1629,7 +1619,7 @@ err1:
 /**
  * cxlflash_afu_recover() - initiates AFU recovery
  * @sdev:	SCSI device associated with LUN.
- * @recover:	Recover ioctl data structure.
+ * @arg:	Recover ioctl data structure.
  *
  * Only a single recovery is allowed at a time to avoid exhausting CXL
  * resources (leading to recovery failure) in the event that we're up
@@ -1656,9 +1646,9 @@ err1:
  *
  * Return: 0 on success, -errno on failure
  */
-static int cxlflash_afu_recover(struct scsi_device *sdev,
-				struct dk_cxlflash_recover_afu *recover)
+static int cxlflash_afu_recover(struct scsi_device *sdev, void *arg)
 {
+	struct dk_cxlflash_recover_afu *recover = arg;
 	struct cxlflash_cfg *cfg = shost_priv(sdev->host);
 	struct device *dev = &cfg->dev->dev;
 	struct llun_info *lli = sdev->hostdata;
@@ -1799,13 +1789,12 @@ static int process_sense(struct scsi_device *sdev,
 	switch (sshdr.sense_key) {
 	case NO_SENSE:
 	case RECOVERED_ERROR:
-		/* fall through */
 	case NOT_READY:
 		break;
 	case UNIT_ATTENTION:
 		switch (sshdr.asc) {
 		case 0x29: /* Power on Reset or Device Reset */
-			/* fall through */
+			fallthrough;
 		case 0x2A: /* Device settings/capacity changed */
 			rc = read_cap16(sdev, lli);
 			if (rc) {
@@ -1838,13 +1827,13 @@ out:
 /**
  * cxlflash_disk_verify() - verifies a LUN is the same and handle size changes
  * @sdev:	SCSI device associated with LUN.
- * @verify:	Verify ioctl data structure.
+ * @arg:	Verify ioctl data structure.
  *
  * Return: 0 on success, -errno on failure
  */
-static int cxlflash_disk_verify(struct scsi_device *sdev,
-				struct dk_cxlflash_verify *verify)
+static int cxlflash_disk_verify(struct scsi_device *sdev, void *arg)
 {
+	struct dk_cxlflash_verify *verify = arg;
 	int rc = 0;
 	struct ctx_info *ctxi = NULL;
 	struct cxlflash_cfg *cfg = shost_priv(sdev->host);
@@ -1928,7 +1917,7 @@ out:
  *
  * Return: A string identifying the decoded ioctl.
  */
-static char *decode_ioctl(int cmd)
+static char *decode_ioctl(unsigned int cmd)
 {
 	switch (cmd) {
 	case DK_CXLFLASH_ATTACH:
@@ -2055,7 +2044,7 @@ err1:
  *
  * Return: 0 on success, -errno on failure
  */
-static int ioctl_common(struct scsi_device *sdev, int cmd)
+static int ioctl_common(struct scsi_device *sdev, unsigned int cmd)
 {
 	struct cxlflash_cfg *cfg = shost_priv(sdev->host);
 	struct device *dev = &cfg->dev->dev;
@@ -2100,7 +2089,7 @@ out:
  *
  * Return: 0 on success, -errno on failure
  */
-int cxlflash_ioctl(struct scsi_device *sdev, int cmd, void __user *arg)
+int cxlflash_ioctl(struct scsi_device *sdev, unsigned int cmd, void __user *arg)
 {
 	typedef int (*sioctl) (struct scsi_device *, void *);
 
@@ -2120,16 +2109,16 @@ int cxlflash_ioctl(struct scsi_device *sdev, int cmd, void __user *arg)
 		size_t size;
 		sioctl ioctl;
 	} ioctl_tbl[] = {	/* NOTE: order matters here */
-	{sizeof(struct dk_cxlflash_attach), (sioctl)cxlflash_disk_attach},
+	{sizeof(struct dk_cxlflash_attach), cxlflash_disk_attach},
 	{sizeof(struct dk_cxlflash_udirect), cxlflash_disk_direct_open},
-	{sizeof(struct dk_cxlflash_release), (sioctl)cxlflash_disk_release},
-	{sizeof(struct dk_cxlflash_detach), (sioctl)cxlflash_disk_detach},
-	{sizeof(struct dk_cxlflash_verify), (sioctl)cxlflash_disk_verify},
-	{sizeof(struct dk_cxlflash_recover_afu), (sioctl)cxlflash_afu_recover},
-	{sizeof(struct dk_cxlflash_manage_lun), (sioctl)cxlflash_manage_lun},
+	{sizeof(struct dk_cxlflash_release), cxlflash_disk_release},
+	{sizeof(struct dk_cxlflash_detach), cxlflash_disk_detach},
+	{sizeof(struct dk_cxlflash_verify), cxlflash_disk_verify},
+	{sizeof(struct dk_cxlflash_recover_afu), cxlflash_afu_recover},
+	{sizeof(struct dk_cxlflash_manage_lun), cxlflash_manage_lun},
 	{sizeof(struct dk_cxlflash_uvirtual), cxlflash_disk_virtual_open},
-	{sizeof(struct dk_cxlflash_resize), (sioctl)cxlflash_vlun_resize},
-	{sizeof(struct dk_cxlflash_clone), (sioctl)cxlflash_disk_clone},
+	{sizeof(struct dk_cxlflash_resize), cxlflash_vlun_resize},
+	{sizeof(struct dk_cxlflash_clone), cxlflash_disk_clone},
 	};
 
 	/* Hold read semaphore so we can drain if needed */
@@ -2165,7 +2154,7 @@ int cxlflash_ioctl(struct scsi_device *sdev, int cmd, void __user *arg)
 		if (unlikely(rc))
 			goto cxlflash_ioctl_exit;
 
-		/* fall through */
+		fallthrough;
 
 	case DK_CXLFLASH_MANAGE_LUN:
 		known_ioctl = true;
@@ -2176,15 +2165,14 @@ int cxlflash_ioctl(struct scsi_device *sdev, int cmd, void __user *arg)
 		if (likely(do_ioctl))
 			break;
 
-		/* fall through */
+		fallthrough;
 	default:
 		rc = -EINVAL;
 		goto cxlflash_ioctl_exit;
 	}
 
 	if (unlikely(copy_from_user(&buf, arg, size))) {
-		dev_err(dev, "%s: copy_from_user() fail "
-			"size=%lu cmd=%d (%s) arg=%p\n",
+		dev_err(dev, "%s: copy_from_user() fail size=%lu cmd=%u (%s) arg=%p\n",
 			__func__, size, cmd, decode_ioctl(cmd), arg);
 		rc = -EFAULT;
 		goto cxlflash_ioctl_exit;
@@ -2207,8 +2195,7 @@ int cxlflash_ioctl(struct scsi_device *sdev, int cmd, void __user *arg)
 	rc = do_ioctl(sdev, (void *)&buf);
 	if (likely(!rc))
 		if (unlikely(copy_to_user(arg, &buf, size))) {
-			dev_err(dev, "%s: copy_to_user() fail "
-				"size=%lu cmd=%d (%s) arg=%p\n",
+			dev_err(dev, "%s: copy_to_user() fail size=%lu cmd=%u (%s) arg=%p\n",
 				__func__, size, cmd, decode_ioctl(cmd), arg);
 			rc = -EFAULT;
 		}
